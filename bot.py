@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Flex SMS -> Telegram OTP bot (Railway/Docker-ready, lightweight, fast)
+Flex SMS -> Telegram OTP bot (runs on Railway / VPS / RDP)
 - Auto-solves the "What is X + Y = ?" login captcha
 - Single fast global poll of the SMSCDRStats ajax endpoint
-- Routes each new SMS to the number owner (no overlap)
+- Routes each new SMS to the number owner (full) via SUFFIX MATCH, broadcasts masked copy to groups
 - Admin: add/remove country buttons, upload unlimited-size number txt files
 - Tiny health server on $PORT so Railway keeps it alive
 """
@@ -39,11 +39,15 @@ from telegram.ext import (
 # --------------------------------------------------------------------------- #
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().isdigit()}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()}
+OTP_GROUP_IDS = [int(x) for x in os.getenv("OTP_GROUP_IDS", "").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()]
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/tsbotpworkingzone").strip()
 SITE_BASE = os.getenv("SITE_BASE", "http://168.119.13.175").rstrip("/")
 SITE_USERNAME = os.getenv("SITE_USERNAME", "")
 SITE_PASSWORD = os.getenv("SITE_PASSWORD", "")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1"))
+# how many trailing digits to match SMS number against assigned number
+MATCH_DIGITS = int(os.getenv("MATCH_DIGITS", "9"))
 DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/")
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 PORT = int(os.getenv("PORT", "8080"))
@@ -59,6 +63,20 @@ for noisy in ("httpx", "httpcore", "telegram", "apscheduler", "aiohttp.access"):
 log = logging.getLogger("otpbot")
 
 os.makedirs(DATA_DIR, exist_ok=True)
+
+BOT_USERNAME: Optional[str] = None  # filled at startup
+
+
+def norm(number: str) -> str:
+    """Strip everything but digits."""
+    return re.sub(r"\D", "", number or "")
+
+
+def suffix_key(number: str) -> str:
+    """Last MATCH_DIGITS digits — used to match SMS numbers to assignments."""
+    n = norm(number)
+    return n[-MATCH_DIGITS:] if len(n) > MATCH_DIGITS else n
+
 
 # --------------------------------------------------------------------------- #
 # Storage
@@ -119,23 +137,28 @@ class Store:
             if not pool:
                 return None
             number = pool.pop(0)
-            self.data["assignments"][number] = {"user_id": user_id, "button_id": bid, "button_name": name}
+            # key assignments by suffix so SMS in any format still matches
+            self.data["assignments"][suffix_key(number)] = {
+                "user_id": user_id, "button_id": bid,
+                "button_name": name, "number": number,
+            }
             self._save()
             return number
 
     async def release_number(self, number):
         async with self.lock:
-            self.data["assignments"].pop(number, None)
+            self.data["assignments"].pop(suffix_key(number), None)
             self._save()
 
-    def assignment(self, number):
-        return self.data["assignments"].get(number)
+    def find_assignment(self, sms_number: str):
+        """Match an incoming SMS number to an assignment by trailing digits."""
+        return self.data["assignments"].get(suffix_key(sms_number))
 
 
 store = Store(DATA_FILE)
 
 # --------------------------------------------------------------------------- #
-# Site client (keep-alive connector, session reuse = fast + reliable)
+# Site client
 # --------------------------------------------------------------------------- #
 class SmsClient:
     def __init__(self):
@@ -241,7 +264,7 @@ class SmsClient:
             out.append({
                 "date": date,
                 "range": str(row[1]),
-                "number": re.sub(r"\D", "", str(row[2])),
+                "number": norm(str(row[2])),
                 "cli": str(row[3]),
                 "client": str(row[4]),
                 "sms": html.unescape(re.sub(r"<[^>]+>", "", str(row[5]))),
@@ -250,6 +273,26 @@ class SmsClient:
 
 
 client = SmsClient()
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def mask_number(number: str) -> str:
+    """+251917420644 -> +251******644 (keep first 3 + last 3, mask middle)."""
+    n = norm(number)
+    if len(n) <= 6:
+        return "+" + n
+    return "+" + n[:3] + ("*" * (len(n) - 6)) + n[-3:]
+
+
+def group_keyboard():
+    rows = []
+    if BOT_USERNAME:
+        rows.append([InlineKeyboardButton("📲 Get number", url=f"https://t.me/{BOT_USERNAME}?start=1")])
+    if CHANNEL_URL:
+        rows.append([InlineKeyboardButton("📢 Channel", url=CHANNEL_URL)])
+    return InlineKeyboardMarkup(rows) if rows else None
+
 
 # --------------------------------------------------------------------------- #
 # Monitor
@@ -293,20 +336,46 @@ class Monitor:
             await asyncio.sleep(POLL_INTERVAL)
 
     async def _dispatch(self, bot, r):
-        a = store.assignment(r["number"])
-        if not a:
-            return
         otp = self.otp(r["sms"])
-        msg = (
-            f"📩 {html.escape(a['button_name'])} Message Received!\n\n"
-            f"📞 Number : +{html.escape(r['number'])}\n\n"
-            f"🔑 OTP Code: <code>{html.escape(otp)}</code>\n\n"
-            f"💬 Full Message:\n{html.escape(r['sms'])}"
-        )
+        a = store.find_assignment(r["number"])  # suffix match
+
+        # 1) private message to the owner (full number) — fire first for speed
+        if a:
+            priv = (
+                f"📩 {html.escape(a['button_name'])} Message Received!\n\n"
+                f"📞 Number : +{html.escape(a.get('number') or r['number'])}\n\n"
+                f"🔑 OTP Code: <code>{html.escape(otp)}</code>\n\n"
+                f"💬 Full Message:\n{html.escape(r['sms'])}"
+            )
+            try:
+                await bot.send_message(chat_id=a["user_id"], text=priv, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                log.warning("send to owner %s failed: %s", a["user_id"], e)
+        else:
+            log.info("No owner for number %s (suffix %s)", r["number"], suffix_key(r["number"]))
+
+        # 2) masked broadcast to all OTP groups (concurrent = fast)
+        if OTP_GROUP_IDS:
+            country = a["button_name"] if a else r["range"]
+            grp = (
+                f"{html.escape(country)} Message Received!\n\n"
+                f"📞 Number: {html.escape(mask_number(r['number']))}\n\n"
+                f"🔑 OTP Code: <code>{html.escape(otp)}</code>\n\n"
+                f"💬 Message:\n{html.escape(r['sms'])}"
+            )
+            kb = group_keyboard()
+            await asyncio.gather(
+                *[self._send_group(bot, gid, grp, kb) for gid in OTP_GROUP_IDS],
+                return_exceptions=True,
+            )
+
+    @staticmethod
+    async def _send_group(bot, gid, text, kb):
         try:
-            await bot.send_message(chat_id=a["user_id"], text=msg, parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id=gid, text=text, parse_mode=ParseMode.HTML,
+                                   reply_markup=kb, disable_web_page_preview=True)
         except Exception as e:
-            log.warning("send to %s failed: %s", a["user_id"], e)
+            log.warning("send to group %s failed: %s", gid, e)
 
 
 monitor = Monitor()
@@ -402,14 +471,13 @@ async def on_document(update, ctx):
     if not (isinstance(awaiting, tuple) and awaiting[0] == "upload" and is_admin(uid)):
         return
     bid = awaiting[1]
-    # stream to a temp file, then parse line-by-line -> low memory, big files OK
     tmp_path = os.path.join(tempfile.gettempdir(), f"upl_{uid}.txt")
     file = await update.message.document.get_file()
     await file.download_to_drive(tmp_path)
     numbers = []
     with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
         for ln in f:
-            n = re.sub(r"\D", "", ln)
+            n = norm(ln)
             if n:
                 numbers.append(n)
     try:
@@ -475,7 +543,7 @@ async def _send_assigned(q, btn, number):
     await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 # --------------------------------------------------------------------------- #
-# Health server (Railway needs a bound port)
+# Health server
 # --------------------------------------------------------------------------- #
 async def _health(request):
     return web.Response(text="ok")
@@ -492,6 +560,10 @@ async def start_health_server():
 
 # --------------------------------------------------------------------------- #
 async def on_startup(app):
+    global BOT_USERNAME
+    me = await app.bot.get_me()
+    BOT_USERNAME = me.username
+    log.info("Bot @%s", BOT_USERNAME)
     await start_health_server()
     await client.start()
     await client.login()
