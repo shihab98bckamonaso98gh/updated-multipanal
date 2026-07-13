@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Flex SMS -> Telegram OTP bot (Railway-ready, lightweight, fast)
+Flex SMS -> Telegram OTP bot (Railway/Docker-ready, lightweight, fast)
 - Auto-solves the "What is X + Y = ?" login captcha
 - Single fast global poll of the SMSCDRStats ajax endpoint
 - Routes each new SMS to the number owner (no overlap)
