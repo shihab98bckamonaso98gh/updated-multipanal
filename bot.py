@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Flex SMS -> Telegram OTP bot (runs on Railway / VPS / RDP)
+Flex SMS -> Telegram OTP bot (runs on Railway / VPS / RDP, 24/7 stable)
 - Auto-solves the "What is X + Y = ?" login captcha
 - Single fast global poll of the SMSCDRStats ajax endpoint
-- Routes each new SMS to the number owner (full) via SUFFIX MATCH, broadcasts masked copy to groups
+- Routes each new SMS to the number owner (full) via suffix match, masked copy to groups
 - Admin: add/remove country buttons, upload unlimited-size number txt files
-- Tiny health server on $PORT so Railway keeps it alive
+- Deletes any active webhook on boot -> no getUpdates conflict
+- Health server on $PORT
 """
 
 import os
@@ -28,6 +29,7 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.constants import ParseMode
+from telegram.error import Conflict, NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -46,7 +48,6 @@ SITE_BASE = os.getenv("SITE_BASE", "http://168.119.13.175").rstrip("/")
 SITE_USERNAME = os.getenv("SITE_USERNAME", "")
 SITE_PASSWORD = os.getenv("SITE_PASSWORD", "")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1"))
-# how many trailing digits to match SMS number against assigned number
 MATCH_DIGITS = int(os.getenv("MATCH_DIGITS", "9"))
 DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/")
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
@@ -64,16 +65,14 @@ log = logging.getLogger("otpbot")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-BOT_USERNAME: Optional[str] = None  # filled at startup
+BOT_USERNAME: Optional[str] = None
 
 
 def norm(number: str) -> str:
-    """Strip everything but digits."""
     return re.sub(r"\D", "", number or "")
 
 
 def suffix_key(number: str) -> str:
-    """Last MATCH_DIGITS digits — used to match SMS numbers to assignments."""
     n = norm(number)
     return n[-MATCH_DIGITS:] if len(n) > MATCH_DIGITS else n
 
@@ -137,7 +136,6 @@ class Store:
             if not pool:
                 return None
             number = pool.pop(0)
-            # key assignments by suffix so SMS in any format still matches
             self.data["assignments"][suffix_key(number)] = {
                 "user_id": user_id, "button_id": bid,
                 "button_name": name, "number": number,
@@ -151,7 +149,6 @@ class Store:
             self._save()
 
     def find_assignment(self, sms_number: str):
-        """Match an incoming SMS number to an assignment by trailing digits."""
         return self.data["assignments"].get(suffix_key(sms_number))
 
 
@@ -173,12 +170,10 @@ class SmsClient:
 
     async def start(self):
         if self.session is None or self.session.closed:
-            jar = aiohttp.CookieJar(unsafe=True)  # allow cookies from bare-IP host
+            jar = aiohttp.CookieJar(unsafe=True)
             connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300, keepalive_timeout=60)
             self.session = aiohttp.ClientSession(
-                headers=self.headers,
-                cookie_jar=jar,
-                connector=connector,
+                headers=self.headers, cookie_jar=jar, connector=connector,
                 timeout=aiohttp.ClientTimeout(total=20),
             )
 
@@ -278,7 +273,6 @@ client = SmsClient()
 # Helpers
 # --------------------------------------------------------------------------- #
 def mask_number(number: str) -> str:
-    """+251917420644 -> +251******644 (keep first 3 + last 3, mask middle)."""
     n = norm(number)
     if len(n) <= 6:
         return "+" + n
@@ -300,6 +294,7 @@ def group_keyboard():
 class Monitor:
     def __init__(self):
         self.seen = set()
+        self.task: Optional[asyncio.Task] = None
 
     @staticmethod
     def _key(r):
@@ -323,7 +318,7 @@ class Monitor:
         while True:
             try:
                 rows = await client.fetch_rows()
-                for r in reversed(rows):  # oldest first
+                for r in reversed(rows):
                     k = self._key(r)
                     if k in self.seen:
                         continue
@@ -331,15 +326,17 @@ class Monitor:
                     await self._dispatch(bot, r)
                 if len(self.seen) > 5000:
                     self.seen = set(list(self.seen)[-2000:])
+            except asyncio.CancelledError:
+                log.info("Monitor stopped.")
+                raise
             except Exception as e:
                 log.warning("tick error: %s", e)
             await asyncio.sleep(POLL_INTERVAL)
 
     async def _dispatch(self, bot, r):
         otp = self.otp(r["sms"])
-        a = store.find_assignment(r["number"])  # suffix match
+        a = store.find_assignment(r["number"])
 
-        # 1) private message to the owner (full number) — fire first for speed
         if a:
             priv = (
                 f"📩 {html.escape(a['button_name'])} Message Received!\n\n"
@@ -354,7 +351,6 @@ class Monitor:
         else:
             log.info("No owner for number %s (suffix %s)", r["number"], suffix_key(r["number"]))
 
-        # 2) masked broadcast to all OTP groups (concurrent = fast)
         if OTP_GROUP_IDS:
             country = a["button_name"] if a else r["range"]
             grp = (
@@ -543,6 +539,20 @@ async def _send_assigned(q, btn, number):
     await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 # --------------------------------------------------------------------------- #
+# Error handler — swallows transient Conflict/Network so the bot never dies
+# --------------------------------------------------------------------------- #
+async def on_error(update, ctx):
+    err = ctx.error
+    if isinstance(err, Conflict):
+        log.error("Conflict: webhook active or another instance polling. "
+                  "Webhook is auto-deleted on boot; ensure only ONE instance runs.")
+        return
+    if isinstance(err, NetworkError):
+        log.warning("Network hiccup: %s (will retry automatically)", err)
+        return
+    log.warning("Handler error: %s", err)
+
+# --------------------------------------------------------------------------- #
 # Health server
 # --------------------------------------------------------------------------- #
 async def _health(request):
@@ -564,25 +574,41 @@ async def on_startup(app):
     me = await app.bot.get_me()
     BOT_USERNAME = me.username
     log.info("Bot @%s", BOT_USERNAME)
+    # THE FIX: kill any active webhook + drop backlog before polling starts
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook cleared, polling mode ready.")
+    except Exception as e:
+        log.warning("delete_webhook failed: %s", e)
     await start_health_server()
     await client.start()
     await client.login()
     await monitor.prime()
-    app.create_task(monitor.loop(app.bot))
+    # start monitor AFTER app is running (no PTBUserWarning, survives 24/7)
+    monitor.task = asyncio.create_task(monitor.loop(app.bot))
 
 async def on_shutdown(app):
+    if monitor.task and not monitor.task.done():
+        monitor.task.cancel()
     await client.close()
 
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN missing")
-    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).post_shutdown(on_shutdown).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
     log.info("Bot starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
